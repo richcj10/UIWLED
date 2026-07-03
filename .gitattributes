@@ -1,0 +1,12 @@
+# Force LF for anything that runs inside the Linux container.
+# Windows CRLF endings break run.sh and the agent script upload.
+*.sh    text eol=lf
+*.go    text eol=lf
+*.py    text eol=lf
+*.yaml  text eol=lf
+*.yml   text eol=lf
+*.json  text eol=lf
+Dockerfile text eol=lf
+
+# Binary assets — never touch.
+*.png binary

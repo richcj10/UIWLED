@@ -1,0 +1,20 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to UIWLED",
+        "description": "Enter the host and port where the UIWLED addon is running. On this Home Assistant host it's typically localhost:8080.",
+        "data": {
+          "host": "Host or IP",
+          "port": "Port"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Could not reach UIWLED at that address. Check that the addon is running and the port is correct."
+    },
+    "abort": {
+      "already_configured": "This UIWLED addon is already configured."
+    }
+  }
+}

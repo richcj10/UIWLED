@@ -1,0 +1,26 @@
+# Build artifacts
+uiwled/app/uiwled
+uiwled/app/uiwled.exe
+uiwled/app/**/*.test
+
+# Runtime state (only created inside the addon container)
+data/
+state.json
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Logs
+*.log

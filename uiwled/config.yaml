@@ -1,0 +1,47 @@
+name: "UIWLED"
+version: "0.1.0"
+slug: "uiwled"
+description: "WLED-style color picker and effects engine for Ubiquiti Etherlighting switches"
+url: "https://github.com/richcj10/uiwled"
+startup: services
+boot: auto
+init: false
+arch:
+  - aarch64
+  - amd64
+  - armhf
+  - armv7
+  - i386
+
+host_network: false
+ingress: true
+ingress_port: 8080
+panel_icon: mdi:led-strip-variant
+panel_title: "UIWLED"
+
+ports:
+  8080/tcp: 8080
+ports_description:
+  8080/tcp: "UIWLED web UI (also available via HA sidebar)"
+
+options:
+  switches:
+    - name: "switch1"
+      host: "192.168.1.2"
+      user: "admin"
+      password: ""
+      ssh_key: ""
+  listen_port: 8080
+  log_level: "info"
+  target_fps: 15
+
+schema:
+  switches:
+    - name: str
+      host: str
+      user: str
+      password: password?
+      ssh_key: str?
+  listen_port: port
+  log_level: list(debug|info|warn|error)
+  target_fps: int(1,60)

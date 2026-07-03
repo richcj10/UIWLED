@@ -1,0 +1,84 @@
+set_port:
+  name: Set jack color
+  description: Override a single RJ45 jack to a specific RGB color, on top of any running effect. Persists until cleared or its duration elapses.
+  fields:
+    host:
+      name: Addon host
+      description: The UIWLED addon host as configured (usually localhost). Only needed if you have multiple UIWLED addons.
+      required: false
+      example: "localhost"
+      selector:
+        text:
+    switch:
+      name: Switch name
+      description: The switch name as configured in the addon (e.g. 48_Port).
+      required: true
+      example: "48_Port"
+      selector:
+        text:
+    port:
+      name: Jack number
+      description: 1-based port index.
+      required: true
+      example: 5
+      selector:
+        number:
+          min: 1
+          max: 96
+          mode: box
+    rgb_color:
+      name: RGB color
+      description: Color as [R, G, B] with each channel 0-255.
+      required: true
+      example: "[255, 0, 0]"
+      selector:
+        color_rgb:
+    duration_ms:
+      name: Duration (ms)
+      description: If > 0, the override auto-clears after this many milliseconds. 0 = persist until cleared.
+      required: false
+      default: 0
+      example: 3000
+      selector:
+        number:
+          min: 0
+          max: 3600000
+          mode: box
+
+clear_port:
+  name: Clear jack override
+  description: Remove the color override for a specific jack so it returns to the effect.
+  fields:
+    host:
+      name: Addon host
+      required: false
+      selector:
+        text:
+    switch:
+      name: Switch name
+      required: true
+      selector:
+        text:
+    port:
+      name: Jack number
+      required: true
+      selector:
+        number:
+          min: 1
+          max: 96
+          mode: box
+
+clear_all_ports:
+  name: Clear all jack overrides
+  description: Remove every jack color override for the switch.
+  fields:
+    host:
+      name: Addon host
+      required: false
+      selector:
+        text:
+    switch:
+      name: Switch name
+      required: true
+      selector:
+        text:
