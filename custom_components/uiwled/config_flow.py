@@ -1,61 +1,44 @@
 """Config flow for UIWLED."""
 from __future__ import annotations
 
-import logging
 from typing import Any
 
-import aiohttp
 import voluptuous as vol
-from homeassistant import config_entries
-from homeassistant.data_entry_flow import FlowResult
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
-from .const import CONF_HOST, CONF_PORT, DEFAULT_PORT, DOMAIN
-
-_LOGGER = logging.getLogger(__name__)
+from .const import CONF_HOST, CONF_PORT, DEFAULT_HOST, DEFAULT_PORT, DOMAIN
 
 
-async def _probe(hass, host: str, port: int) -> bool:
-    """Return True if the UIWLED addon answers on this host/port."""
-    url = f"http://{host}:{port}/api/switches"
-    session = async_get_clientsession(hass)
-    try:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-            if resp.status != 200:
-                return False
-            payload = await resp.json()
-            return isinstance(payload, list)
-    except Exception as err:
-        _LOGGER.debug("UIWLED probe failed for %s:%s — %s", host, port, err)
-        return False
-
-
-class UiwledConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
-    """Handle the config flow for UIWLED."""
+class UIWLEDConfigFlow(ConfigFlow, domain=DOMAIN):
+    """Ask the user for the addon's host/port and validate it responds."""
 
     VERSION = 1
 
-    async def async_step_user(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+    async def async_step_user(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         errors: dict[str, str] = {}
         if user_input is not None:
-            host = user_input[CONF_HOST].strip()
-            port = user_input.get(CONF_PORT, DEFAULT_PORT)
-
-            # Prevent duplicate entries for the same addon.
-            await self.async_set_unique_id(f"{host}:{port}")
+            host = user_input[CONF_HOST]
+            port = int(user_input[CONF_PORT])
+            unique = f"{host}:{port}"
+            await self.async_set_unique_id(unique)
             self._abort_if_unique_id_configured()
 
-            if await _probe(self.hass, host, port):
-                return self.async_create_entry(
-                    title=f"UIWLED @ {host}",
-                    data={CONF_HOST: host, CONF_PORT: port},
-                )
-            errors["base"] = "cannot_connect"
+            session = async_get_clientsession(self.hass)
+            try:
+                async with session.get(f"http://{host}:{port}/healthz", timeout=5) as resp:
+                    if resp.status != 200:
+                        errors["base"] = "cannot_connect"
+            except Exception:  # noqa: BLE001
+                errors["base"] = "cannot_connect"
+
+            if not errors:
+                return self.async_create_entry(title=f"UIWLED ({host})", data=user_input)
 
         schema = vol.Schema(
             {
-                vol.Required(CONF_HOST, default="localhost"): str,
-                vol.Optional(CONF_PORT, default=DEFAULT_PORT): int,
+                vol.Required(CONF_HOST, default=DEFAULT_HOST): str,
+                vol.Required(CONF_PORT, default=DEFAULT_PORT): int,
             }
         )
         return self.async_show_form(step_id="user", data_schema=schema, errors=errors)

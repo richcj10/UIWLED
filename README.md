@@ -51,7 +51,14 @@ UIWLED/
 
 ### Home Assistant integration
 
-Copy `custom_components/uiwled/` into `<config>/custom_components/` on your HA instance (or use HACS once packaged), restart HA, then Settings → Devices & Services → **Add Integration** → **UIWLED** → host `localhost`, port `8080`.
+Install via **HACS** (recommended):
+
+1. HACS → Integrations → ⋮ → **Custom repositories**
+2. Repository `https://github.com/richcj10/UIWLED`, Category **Integration** → Add
+3. Install **UIWLED** from the HACS list, restart Home Assistant.
+4. Settings → Devices & Services → **Add Integration** → **UIWLED** → host `localhost`, port `8080`.
+
+Or manually: copy `custom_components/uiwled/` into `<config>/custom_components/` on your HA instance, restart, then add the integration as above.
 
 Each switch shows up as a `light.` entity with RGB + brightness + effect select, plus three services (`uiwled.set_port`, `uiwled.clear_port`, `uiwled.clear_all_ports`) for per-jack alerts and automations.
 

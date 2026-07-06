@@ -1,5 +1,5 @@
 name: "UIWLED"
-version: "0.1.0"
+version: "1.0.0"
 slug: "uiwled"
 description: "WLED-style color picker and effects engine for Ubiquiti Etherlighting switches"
 url: "https://github.com/richcj10/uiwled"

@@ -1,11 +1,8 @@
-"""Light platform for UIWLED — one entity per configured switch."""
+"""Light platform — one light entity per configured switch."""
 from __future__ import annotations
 
-import logging
-from datetime import timedelta
 from typing import Any
 
-import aiohttp
 from homeassistant.components.light import (
     ATTR_BRIGHTNESS,
     ATTR_EFFECT,
@@ -15,161 +12,116 @@ from homeassistant.components.light import (
     LightEntityFeature,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import CONF_HOST, CONF_PORT, DEFAULT_PORT, DOMAIN, POLL_INTERVAL_SECONDS
-
-_LOGGER = logging.getLogger(__name__)
-
-SCAN_INTERVAL = timedelta(seconds=POLL_INTERVAL_SECONDS)
-
-# WLED-style effect list. Falls back to whatever /api/effects returns from the addon.
-_DEFAULT_EFFECTS: list[dict] = [{"id": 0, "name": "Solid"}]
-
-
-async def _get_json(session: aiohttp.ClientSession, url: str) -> Any:
-    async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-        resp.raise_for_status()
-        return await resp.json()
+from .const import DOMAIN
+from .coordinator import UIWLEDCoordinator
 
 
 async def async_setup_entry(
-    hass: HomeAssistant,
-    entry: ConfigEntry,
-    add_entities: AddEntitiesCallback,
+    hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
 ) -> None:
-    """Fetch the addon's switch list and create one light per switch."""
-    data = hass.data[DOMAIN][entry.entry_id]
-    host: str = data[CONF_HOST]
-    port: int = data.get(CONF_PORT, DEFAULT_PORT)
-    base_url = f"http://{host}:{port}"
+    coordinator: UIWLEDCoordinator = hass.data[DOMAIN][entry.entry_id]
 
-    session = async_get_clientsession(hass)
-    try:
-        switches = await _get_json(session, f"{base_url}/api/switches")
-        effects = await _get_json(session, f"{base_url}/api/effects")
-    except Exception as err:
-        _LOGGER.error("Failed to fetch switches/effects from %s: %s", base_url, err)
-        switches = []
-        effects = _DEFAULT_EFFECTS
+    known: set[str] = set()
 
-    entities = [UiwledLight(base_url, sw, effects) for sw in switches]
-    add_entities(entities, update_before_add=True)
+    @callback
+    def _add_new() -> None:
+        new: list[UIWLEDLight] = []
+        for name in (coordinator.data or {}):
+            if name not in known:
+                known.add(name)
+                new.append(UIWLEDLight(coordinator, entry.entry_id, name))
+        if new:
+            async_add_entities(new)
+
+    _add_new()
+    entry.async_on_unload(coordinator.async_add_listener(_add_new))
 
 
-class UiwledLight(LightEntity):
-    """One switch = one light. RGB + brightness + effect selection."""
+class UIWLEDLight(CoordinatorEntity[UIWLEDCoordinator], LightEntity):
+    """One `light.` entity per UIWLED switch."""
 
+    _attr_has_entity_name = True
+    _attr_name = None
     _attr_supported_color_modes = {ColorMode.RGB}
     _attr_color_mode = ColorMode.RGB
     _attr_supported_features = LightEntityFeature.EFFECT
-    _attr_should_poll = True
 
-    def __init__(self, base_url: str, sw_dto: dict, effects: list[dict]) -> None:
-        self._base_url = base_url
-        self._sw_name: str = sw_dto["name"]
-        self._attr_unique_id = f"uiwled_{self._sw_name}"
-        self._attr_name = f"UIWLED {self._sw_name}"
-        self._effects_by_id: dict[int, str] = {e["id"]: e["name"] for e in effects}
-        self._effects_by_name: dict[str, int] = {e["name"]: e["id"] for e in effects}
-        self._attr_effect_list = [e["name"] for e in effects]
-
-        # Attribution: seed from initial DTO if present.
-        st = sw_dto.get("state") or {}
-        self._is_on = bool(st.get("On", True))
-        self._brightness = int(st.get("Brightness", 128))
-        colors = st.get("Colors") or []
-        c0 = colors[0] if colors else {}
-        self._rgb = (
-            int(c0.get("R", 255)),
-            int(c0.get("G", 160)),
-            int(c0.get("B", 0)),
+    def __init__(self, coordinator: UIWLEDCoordinator, entry_id: str, switch_name: str) -> None:
+        super().__init__(coordinator)
+        self._switch_name = switch_name
+        self._attr_unique_id = f"{entry_id}_{switch_name}"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, self._attr_unique_id)},
+            manufacturer="Ubiquiti (via UIWLED)",
+            name=f"UIWLED {switch_name}",
         )
-        self._effect = self._effects_by_id.get(int(st.get("EffectID", 0)), "Solid")
 
     @property
-    def is_on(self) -> bool:
-        return self._is_on
+    def _sw(self) -> dict[str, Any] | None:
+        return (self.coordinator.data or {}).get(self._switch_name)
+
+    @property
+    def _state(self) -> dict[str, Any] | None:
+        sw = self._sw
+        return sw.get("state") if sw else None
+
+    @property
+    def available(self) -> bool:
+        sw = self._sw
+        return bool(sw and sw.get("online"))
+
+    @property
+    def is_on(self) -> bool | None:
+        st = self._state
+        return bool(st.get("On")) if st else None
 
     @property
     def brightness(self) -> int | None:
-        return self._brightness
+        st = self._state
+        return int(st.get("Brightness", 0)) if st else None
 
     @property
     def rgb_color(self) -> tuple[int, int, int] | None:
-        return self._rgb
+        st = self._state
+        if not st:
+            return None
+        colors = st.get("Colors") or []
+        if not colors:
+            return None
+        c = colors[0]
+        return int(c.get("R", 0)), int(c.get("G", 0)), int(c.get("B", 0))
+
+    @property
+    def effect_list(self) -> list[str]:
+        return sorted(self.coordinator.effects_by_name.keys())
 
     @property
     def effect(self) -> str | None:
-        return self._effect
+        st = self._state
+        if not st:
+            return None
+        return self.coordinator.effects_by_id.get(int(st.get("EffectID", 0)))
 
     async def async_turn_on(self, **kwargs: Any) -> None:
-        session = async_get_clientsession(self.hass)
-        # Order matters slightly: turn on first so subsequent writes land on an active state.
-        await self._call(session, f"/api/power/{self._sw_name}?on=1")
-
-        if ATTR_BRIGHTNESS in kwargs:
-            b = int(kwargs[ATTR_BRIGHTNESS])
-            await self._call(session, f"/api/brightness/{self._sw_name}?value={b}")
-            self._brightness = b
-
+        client = self.coordinator.client
+        name = self._switch_name
         if ATTR_RGB_COLOR in kwargs:
             r, g, b = kwargs[ATTR_RGB_COLOR]
-            await self._call(
-                session,
-                f"/api/color/{self._sw_name}?slot=0&r={int(r)}&g={int(g)}&b={int(b)}",
-            )
-            self._rgb = (int(r), int(g), int(b))
-
+            await client.set_color(name, r, g, b)
+        if ATTR_BRIGHTNESS in kwargs:
+            await client.set_brightness(name, int(kwargs[ATTR_BRIGHTNESS]))
         if ATTR_EFFECT in kwargs:
-            eff_name = kwargs[ATTR_EFFECT]
-            eff_id = self._effects_by_name.get(eff_name)
-            if eff_id is not None:
-                await self._call(session, f"/api/effect/{self._sw_name}?id={eff_id}")
-                self._effect = eff_name
-
-        self._is_on = True
-        self.async_write_ha_state()
+            fx_id = self.coordinator.effects_by_name.get(kwargs[ATTR_EFFECT])
+            if fx_id is not None:
+                await client.set_effect(name, fx_id)
+        await client.set_power(name, True)
+        await self.coordinator.async_request_refresh()
 
     async def async_turn_off(self, **kwargs: Any) -> None:
-        session = async_get_clientsession(self.hass)
-        await self._call(session, f"/api/power/{self._sw_name}?on=0")
-        self._is_on = False
-        self.async_write_ha_state()
-
-    async def async_update(self) -> None:
-        """Poll the addon so external UI changes reflect in HA."""
-        session = async_get_clientsession(self.hass)
-        try:
-            switches = await _get_json(session, f"{self._base_url}/api/switches")
-        except Exception as err:
-            _LOGGER.debug("UIWLED poll failed for %s: %s", self._sw_name, err)
-            return
-        for sw in switches:
-            if sw.get("name") != self._sw_name:
-                continue
-            self._attr_available = bool(sw.get("online", False))
-            st = sw.get("state") or {}
-            self._is_on = bool(st.get("On", True))
-            self._brightness = int(st.get("Brightness", 128))
-            colors = st.get("Colors") or []
-            if colors:
-                c0 = colors[0]
-                self._rgb = (
-                    int(c0.get("R", 0)),
-                    int(c0.get("G", 0)),
-                    int(c0.get("B", 0)),
-                )
-            self._effect = self._effects_by_id.get(int(st.get("EffectID", 0)), self._effect)
-            return
-
-    async def _call(self, session: aiohttp.ClientSession, path: str) -> None:
-        url = f"{self._base_url}{path}"
-        try:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                if resp.status >= 400:
-                    _LOGGER.warning("UIWLED %s returned %s", url, resp.status)
-        except Exception as err:
-            _LOGGER.warning("UIWLED call to %s failed: %s", url, err)
+        await self.coordinator.client.set_power(self._switch_name, False)
+        await self.coordinator.async_request_refresh()
