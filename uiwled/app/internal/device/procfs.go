@@ -4,27 +4,44 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // procfs command builders.
 //
 // Etherlighting exposes writable files under /proc/led/:
 //
-//   /proc/led/led_mode           — "0" (write to all ports) or "1" (write to connected only)
-//   /proc/led/led_config         — set a firmware animation mode
-//   /proc/led/led_all_port_code  — "RR GG BB brightness" (hex per channel, brightness 0-100)
-//   /proc/led/led_color          — "<port> <r|g|b> <value*100>"  (per-jack, per-channel)
+//   /proc/led/led_mode            — "0" (write to all ports) or "1" (write to connected only)
+//   /proc/led/led_config          — set a firmware animation mode
+//   /proc/led/led_all_port_color  — "R G B W" (each 0-65535)
+//   /proc/led/led_color           — "<port> <r|g|b|w> <0-65535>"  (per-jack, per-channel)
+//   /proc/led/led_behavior        — 0 = solid, 2-11 = controller-side breathe (faster as it rises)
 //
 // Every custom-color write session must be preceded by `echo 0 > /proc/led/led_mode`
 // to enable full-port control. led_config must NOT be written when running
 // custom colors — it snaps the switch back into a firmware animation.
+//
+// Measured cost on fw 7.5.15 (MIPS 34Kc): ~1.9 ms per led_color write and
+// ~14 ms per led_all_port_color write, mostly kernel time talking to the LED
+// controller. Fewer writes is the only way to go faster.
 
 const (
-	pathLEDMode    = "/proc/led/led_mode"
-	pathLEDConfig  = "/proc/led/led_config"
-	pathLEDAll     = "/proc/led/led_all_port_code"
-	pathLEDPerPort = "/proc/led/led_color"
+	pathLEDMode     = "/proc/led/led_mode"
+	pathLEDConfig   = "/proc/led/led_config"
+	pathLEDAll      = "/proc/led/led_all_port_color"
+	pathLEDPerPort  = "/proc/led/led_color"
+	pathLEDBehavior = "/proc/led/led_behavior"
 )
+
+// ChannelWrite is one led_color write: a single color channel of one port.
+type ChannelWrite struct {
+	Port  int
+	Ch    byte  // 'r', 'g' or 'b'
+	Value uint8 // 0-255; scaled to the driver's 0-65535 range on send
+}
+
+// scale16 maps an 8-bit channel onto the driver's 16-bit range (255 -> 65535).
+func scale16(v uint8) int { return int(v) * 257 }
 
 // CmdSetLEDMode returns the shell command to enable custom-color writes.
 func CmdSetLEDMode(mode uint8) string {
@@ -32,34 +49,13 @@ func CmdSetLEDMode(mode uint8) string {
 }
 
 // CmdSetAllPorts returns the shell command to set every jack to one color.
-func CmdSetAllPorts(c Color, brightness uint8) string {
-	if brightness > 100 {
-		brightness = 100
-	}
-	return fmt.Sprintf("echo '%02X %02X %02X %d' > %s",
-		c.R, c.G, c.B, brightness, pathLEDAll)
+func CmdSetAllPorts(c Color) string {
+	return fmt.Sprintf("echo '%d %d %d 0' > %s", scale16(c.R), scale16(c.G), scale16(c.B), pathLEDAll)
 }
 
-// CmdSetPortColor returns the three echo commands (r, g, b) for a single jack.
-// Values are scaled by 100 as required by the procfs interface.
-func CmdSetPortColor(port int, c Color) []string {
-	return []string{
-		fmt.Sprintf("echo %d r %d > %s", port, int(c.R)*100, pathLEDPerPort),
-		fmt.Sprintf("echo %d g %d > %s", port, int(c.G)*100, pathLEDPerPort),
-		fmt.Sprintf("echo %d b %d > %s", port, int(c.B)*100, pathLEDPerPort),
-	}
-}
-
-// BuildFrameBatch produces the per-jack write commands for one frame.
-// It intentionally does NOT touch /proc/led/led_mode — writing to led_mode
-// resets all ports first, causing a visible off/on flicker on each frame.
-// Call InitLEDMode() once after connect to put the switch into writable mode.
-func BuildFrameBatch(colors []PortColor) []string {
-	cmds := make([]string, 0, len(colors)*3)
-	for _, pc := range colors {
-		cmds = append(cmds, CmdSetPortColor(pc.Index, pc.Color)...)
-	}
-	return cmds
+// CmdSetChannel returns the shell command for a single led_color write.
+func CmdSetChannel(w ChannelWrite) string {
+	return fmt.Sprintf("echo '%d %c %d' > %s", w.Port, w.Ch, scale16(w.Value), pathLEDPerPort)
 }
 
 // InitLEDMode enables custom-color writes. Call once after connect; do not
@@ -68,36 +64,65 @@ func (c *Client) InitLEDMode() error {
 	return c.ExecBatch([]string{CmdSetLEDMode(0)})
 }
 
-// SetAllPorts sets every jack to one color. Prefers the agent protocol
-// ("A rr gg bb br" on stdin → one procfs write). Falls back to direct exec.
-func (c *Client) SetAllPorts(color Color, brightness uint8) error {
-	if brightness > 100 {
-		brightness = 100
+// SendFrame applies one frame: an optional all-ports base color first, then
+// individual channel writes. Over the agent it ends with an "S" so the agent
+// acks with "K" once the writes are done (see Busy). Falls back to a
+// synchronous exec if the agent isn't available.
+//
+// startBreathe > 0 starts hardware breathe at that rate. Observed on fw
+// 7.5.15: the controller only starts breathing on led_behavior 2 followed by
+// an all-ports write (writing 3-11 from solid, or 2 without the all-ports
+// write, leaves the jacks frozen); once breathing, 2-11 change the rate. So
+// the frame becomes "B 2", the all-ports write (all must be non-nil), the
+// fix-ups, then "B rate".
+func (c *Client) SendFrame(all *Color, writes []ChannelWrite, startBreathe int) error {
+	var sb strings.Builder
+	if startBreathe > 0 {
+		sb.WriteString("B 2\n")
 	}
-	agentCmd := fmt.Sprintf("A %02X %02X %02X %d", color.R, color.G, color.B, brightness)
-	if err := c.shellFF(agentCmd); err == nil {
+	if all != nil {
+		fmt.Fprintf(&sb, "A %d %d %d\n", scale16(all.R), scale16(all.G), scale16(all.B))
+	}
+	for _, w := range writes {
+		fmt.Fprintf(&sb, "C %d %c %d\n", w.Port, w.Ch, scale16(w.Value))
+	}
+	if startBreathe > 2 {
+		fmt.Fprintf(&sb, "B %d\n", startBreathe)
+	}
+	sb.WriteString("S")
+
+	c.pending.Add(1)
+	c.sentAt.Store(time.Now().UnixNano())
+	if err := c.shellFF(sb.String()); err == nil {
 		return nil
 	}
-	return c.ExecBatch([]string{CmdSetAllPorts(color, brightness)})
+	c.pending.Store(0)
+
+	cmds := make([]string, 0, len(writes)+3)
+	if startBreathe > 0 {
+		cmds = append(cmds, fmt.Sprintf("echo 2 > %s", pathLEDBehavior))
+	}
+	if all != nil {
+		cmds = append(cmds, CmdSetAllPorts(*all))
+	}
+	for _, w := range writes {
+		cmds = append(cmds, CmdSetChannel(w))
+	}
+	if startBreathe > 2 {
+		cmds = append(cmds, fmt.Sprintf("echo %d > %s", startBreathe, pathLEDBehavior))
+	}
+	return c.ExecBatch(cmds)
 }
 
-// SetPortColors sends per-jack colors. Emits pre-scaled decimals ("P n R G B"
-// where each is r*100 etc.) so the agent's read loop is arithmetic-free.
-// Falls back to direct exec if the agent isn't ready.
-func (c *Client) SetPortColors(colors []PortColor) error {
-	if len(colors) == 0 {
+// SetBehavior sets the LED controller's behavior: 0 = solid, 2-11 = hardware
+// breathe rate (faster as it rises; visibly saturates around 6). Only changes
+// the rate of a breathe that is already running — starting one needs
+// SendFrame's startBreathe. Out-of-range values are rejected by the driver.
+func (c *Client) SetBehavior(b int) error {
+	if err := c.shellFF(fmt.Sprintf("B %d", b)); err == nil {
 		return nil
 	}
-	var sb strings.Builder
-	for _, pc := range colors {
-		fmt.Fprintf(&sb, "P %d %d %d %d\n",
-			pc.Index, int(pc.Color.R)*100, int(pc.Color.G)*100, int(pc.Color.B)*100)
-	}
-	agentMulti := strings.TrimSuffix(sb.String(), "\n")
-	if err := c.shellFF(agentMulti); err == nil {
-		return nil
-	}
-	return c.ExecBatch(BuildFrameBatch(colors))
+	return c.ExecBatch([]string{fmt.Sprintf("echo %d > %s", b, pathLEDBehavior)})
 }
 
 // FirmwareMode is one of the built-in Etherlighting animations.

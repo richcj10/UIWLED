@@ -51,6 +51,11 @@ const (
 	FxComet         = 100
 	FxPacifica      = 101
 	FxSunrise       = 110
+
+	// Hardware effects: the LED controller animates on its own (see
+	// hwBehavior), so they cost nothing per frame. Not WLED ids.
+	FxHWBreathe    = 120
+	FxHWBreatheMix = 121
 )
 
 // EffectInfo is one row of the effect registry, JSON-serialised by
@@ -96,6 +101,23 @@ var effectRegistry = []EffectInfo{
 	{FxComet, "Comet"},
 	{FxPacifica, "Pacifica"},
 	{FxSunrise, "Sunrise"},
+	{FxHWBreathe, "Breathe (HW)"},
+	{FxHWBreatheMix, "Breathe Mix (HW)"},
+}
+
+// hwBehavior returns the led_behavior value the controller should run for
+// this state: 0 (solid) for software effects, or a hardware breathe rate.
+// Measured on fw 7.5.15: 2..6 breathe progressively faster and 7..11 look
+// the same as 6, so Speed maps onto 2..6.
+func hwBehavior(s *SegmentState) int {
+	if !s.On {
+		return 0
+	}
+	switch s.EffectID {
+	case FxHWBreathe, FxHWBreatheMix:
+		return 2 + int(s.Speed)*4/255
+	}
+	return 0
 }
 
 // Effects returns the registered effect list. Read-only — the returned
@@ -172,7 +194,9 @@ func renderEffect(state *SegmentState, elapsed time.Duration, n int) []device.Co
 		return fxPacifica(state, elapsed, n)
 	case FxSunrise:
 		return fxSunrise(state, elapsed, n)
-	default:
+	case FxHWBreatheMix:
+		return fxHWBreatheMix(state, n)
+	default: // includes FxHWBreathe: a static frame the controller breathes
 		return fxSolid(state, n)
 	}
 }
@@ -252,6 +276,16 @@ func blend(a, b device.Color, t float64) device.Color {
 
 func fxSolid(state *SegmentState, n int) []device.Color {
 	return fillAll(n, scaleColor(state.Colors[0], state.Brightness))
+}
+
+// fxHWBreatheMix: the three palette colors repeated across the jacks, static;
+// the controller does the breathing.
+func fxHWBreatheMix(state *SegmentState, n int) []device.Color {
+	out := make([]device.Color, n)
+	for i := range out {
+		out[i] = scaleColor(state.Colors[i%3], state.Brightness)
+	}
+	return out
 }
 
 func fxBlink(state *SegmentState, elapsed time.Duration, n int) []device.Color {
@@ -413,7 +447,7 @@ func fxSparkle(state *SegmentState, elapsed time.Duration, n int) []device.Color
 	seed := uint32(elapsed.Milliseconds() / 60) // new pattern every 60ms
 	for k := 0; k < density; k++ {
 		seed = seed*1664525 + 1013904223
-		out[int(seed)%n] = device.Color{R: 255, G: 255, B: 255}
+		out[int(seed%uint32(n))] = device.Color{R: 255, G: 255, B: 255}
 	}
 	return out
 }
@@ -590,7 +624,7 @@ func fxChristmas(state *SegmentState, elapsed time.Duration, n int) []device.Col
 	seed := uint32(elapsed.Milliseconds() / 90)
 	for k := 0; k < density; k++ {
 		seed = seed*1664525 + 1013904223
-		out[int(seed)%n] = device.Color{R: 255, G: 255, B: 255}
+		out[int(seed%uint32(n))] = device.Color{R: 255, G: 255, B: 255}
 	}
 	return out
 }
@@ -624,7 +658,7 @@ func fxFireworks(state *SegmentState, elapsed time.Duration, n int) []device.Col
 	seed := uint32(elapsed.Milliseconds() / 60)
 	for k := 0; k < burstDensity; k++ {
 		seed = seed*1664525 + 1013904223
-		idx := int(seed) % n
+		idx := int(seed % uint32(n))
 		// Vary hue by burst position.
 		hue := math.Mod(float64(idx*47), 360)
 		out[idx] = hsvToRGB(hue, 1.0, float64(state.Brightness)/255)
@@ -643,7 +677,7 @@ func fxRain(state *SegmentState, elapsed time.Duration, n int) []device.Color {
 		seed := bucket * 2654435761
 		for k := 0; k < density; k++ {
 			seed = seed*1664525 + 1013904223
-			idx := int(seed) % n
+			idx := int(seed % uint32(n))
 			decay := 1.0 - float64(age)/4.0
 			out[idx] = scaleColor(primary, uint8(decay*255))
 		}
@@ -738,7 +772,7 @@ func fxTwinkle(state *SegmentState, elapsed time.Duration, n int) []device.Color
 	primary := scaleColor(state.Colors[0], state.Brightness)
 	for i := 0; i < n; i++ {
 		// pseudo-random phase per port (stable across frames)
-		phaseOffset := time.Duration((i*2654435761)%int(period.Milliseconds())) * time.Millisecond
+		phaseOffset := time.Duration((uint32(i)*2654435761)%uint32(period.Milliseconds())) * time.Millisecond
 		pElapsed := (elapsed + phaseOffset) % period
 		t := float64(pElapsed) / float64(period)
 		// Intensity: higher = more ports lit at once (shorter dark window)

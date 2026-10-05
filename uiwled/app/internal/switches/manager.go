@@ -6,6 +6,7 @@ package switches
 import (
 	"context"
 	"log/slog"
+	"sort"
 	"sync"
 	"time"
 
@@ -14,26 +15,63 @@ import (
 )
 
 // Switch is the runtime representation of one configured UniFi switch —
-// its identity, current SSH client, cached device info, and the last frame
-// we pushed (used by the diff path). All fields except Name and Host are
-// mutated by supervise() from the manager goroutine and guarded by mu.
+// its identity, current SSH client, cached device info, and what we believe
+// the LEDs currently show (used by the diff path). All fields except Name
+// and Host are guarded by mu.
 type Switch struct {
 	Name string
 	Host string
 
-	mu           sync.Mutex
-	client       *device.Client
-	info         *device.Info
-	lastSent     []device.Color // 1-indexed; index 0 unused (ports are 1-based)
-	lastFullPush time.Time
-	cfg          device.Config
-	log          *slog.Logger
+	mu         sync.Mutex
+	client     *device.Client
+	info       *device.Info
+	hw         []device.Color // what the LEDs show, 1-indexed; nil = unknown
+	lastAll    time.Time      // last led_all_port_color write
+	reassertAt int            // round-robin cursor for the trickle reassert
+	behavior   int            // wanted led_behavior; -1 = unknown
+	breatheOn  bool           // controller confirmed breathing (start sequence sent)
+	cfg        device.Config
+	log        *slog.Logger
 }
 
-// reassertInterval controls how often we re-send the full frame even when no
-// jack has changed. Some switch firmware and the UniFi controller periodically
-// reset LED state; a cheap full re-push snaps our colors back.
-const reassertInterval = 2 * time.Second
+// Write-cost model, measured on a USW-Pro-Max-16-PoE (MIPS 34Kc, fw 7.5.15):
+// one led_color write (one channel of one port) costs ~1.9 ms, mostly kernel
+// time talking to the LED controller, and one led_all_port_color write costs
+// ~14 ms. The driver, not the shell, is the bottleneck, so PushFrame's job is
+// to send as few writes as possible.
+const (
+	channelWriteCost = 1900 * time.Microsecond
+	allPortCost      = 7 // an all-ports write, in channel-write units
+
+	// budgetDuty is the share of each frame interval LED writes may use. The
+	// switch has one CPU that also runs its management plane; leave headroom.
+	budgetDuty = 0.75
+
+	// Channel changes no bigger than 1/minDeltaFrac of the channel's level are
+	// deferred; the trickle reassert settles them later. Relative, so dim
+	// effects (low brightness) don't lose their fade steps. Changes to 0 are
+	// always sent.
+	minDeltaFrac = 64
+
+	// Some firmware / the UniFi controller occasionally reset LED state. Rather
+	// than re-sending the whole frame at once (a ~275 ms stall on 48 ports),
+	// re-send one port per frame when budget allows, or the all-ports color
+	// every uniformReassert when the frame is a single color.
+	reassertPortsPerFrame = 1
+	uniformReassert       = 5 * time.Second
+)
+
+var channels = [3]byte{'r', 'g', 'b'}
+
+func chanVal(c device.Color, i int) uint8 {
+	switch i {
+	case 0:
+		return c.R
+	case 1:
+		return c.G
+	}
+	return c.B
+}
 
 // Info returns the last discovered device info (model, hostname, layout, etc.)
 // or nil if the switch hasn't finished its first connect yet.
@@ -50,90 +88,204 @@ func (s *Switch) Client() *device.Client {
 	return s.client
 }
 
-// PushFrame sends only the changed jacks vs. the last frame, or the full frame
-// if reassertInterval has elapsed since the last full push.
-// `frame` is 1-indexed: frame[1] = port 1's target color, frame[0] ignored.
-//
-// Fast path: when every jack in the target frame is the same color, we use
-// /proc/led/led_all_port_code (one shell write) instead of N*3 per-jack writes.
-// For a 48-port switch that's 144x fewer writes per frame.
-func (s *Switch) PushFrame(frame []device.Color) error {
+// SetBehavior sets the LED controller behavior (0 = solid, 2-11 = hardware
+// breathe rate), sending only changes. Starting a breathe needs a special
+// sequence wrapped around an all-ports write, so that is left to the next
+// PushFrame; rate changes and stopping are sent directly.
+func (s *Switch) SetBehavior(b int) error {
 	s.mu.Lock()
-	client := s.client
-	last := s.lastSent
-	lastFull := s.lastFullPush
+	client, cur, on := s.client, s.behavior, s.breatheOn
 	s.mu.Unlock()
-	if client == nil {
+	if client == nil || b == cur {
 		return nil
 	}
-
-	forceFull := time.Since(lastFull) >= reassertInterval
-
-	// Fast path: uniform frame across all jacks.
-	if uniform, c := frameIsUniform(frame); uniform {
-		// Only skip if the frame is identical to last-sent AND we're not forcing.
-		if !forceFull && lastMatches(last, frame) {
-			return nil
-		}
-		if err := client.SetAllPorts(c, 100); err != nil {
+	if b <= 0 || on {
+		if err := client.SetBehavior(b); err != nil {
 			return err
 		}
-		s.mu.Lock()
-		s.lastSent = append([]device.Color(nil), frame...)
-		s.lastFullPush = time.Now()
-		s.mu.Unlock()
-		return nil
 	}
-
-	// Slow path: per-jack diff.
-	toSend := make([]device.PortColor, 0)
-	for i := 1; i < len(frame); i++ {
-		if forceFull || i >= len(last) || last[i] != frame[i] {
-			toSend = append(toSend, device.PortColor{Index: i, Color: frame[i]})
-		}
-	}
-	if len(toSend) == 0 {
-		return nil
-	}
-	if err := client.SetPortColors(toSend); err != nil {
-		return err
-	}
-
 	s.mu.Lock()
-	s.lastSent = append([]device.Color(nil), frame...)
-	if forceFull {
-		s.lastFullPush = time.Now()
+	s.behavior = b
+	if b <= 0 {
+		s.breatheOn = false
 	}
 	s.mu.Unlock()
 	return nil
 }
 
-// frameIsUniform returns true and the shared color if every jack (index 1+)
-// in the frame is the same color. Ports are 1-based; index 0 is ignored.
-func frameIsUniform(frame []device.Color) (bool, device.Color) {
-	if len(frame) < 2 {
-		return false, device.Color{}
+// PushFrame moves the LEDs toward `frame` (1-indexed: frame[1] = port 1,
+// frame[0] ignored) using at most a frame interval's worth of writes.
+//
+//   - If maxInFlight earlier frames are still unacked by the agent, this one
+//     is skipped: the switch drops frames instead of building a backlog.
+//   - Writes go per channel, only where the value changed by more than
+//     1/minDeltaFrac of its level.
+//   - When one all-ports write plus fix-ups beats the plain diff (e.g. a
+//     mostly-uniform frame), that is used instead.
+//   - Over budget, the biggest changes go first; the rest land next frame.
+func (s *Switch) PushFrame(frame []device.Color, interval time.Duration) error {
+	s.mu.Lock()
+	client := s.client
+	hw := s.hw
+	lastAll := s.lastAll
+	cursor := s.reassertAt
+	// Under hardware breathe, rewriting a port may restart its breathe cycle,
+	// so don't reassert; only real changes are sent.
+	reassert := s.behavior <= 0
+	startBreathe := 0
+	if s.behavior > 0 && !s.breatheOn {
+		startBreathe = s.behavior
 	}
-	first := frame[1]
-	for i := 2; i < len(frame); i++ {
-		if frame[i] != first {
-			return false, device.Color{}
+	s.mu.Unlock()
+	if client == nil || len(frame) < 2 || client.Busy() {
+		return nil
+	}
+	n := len(frame) - 1
+	budget := int(budgetDuty * float64(interval) / float64(channelWriteCost))
+	if budget < 3 {
+		budget = 3
+	}
+
+	next := make([]device.Color, len(frame))
+	if len(hw) == len(frame) {
+		copy(next, hw)
+	}
+	base, baseCount := dominantColor(frame)
+	uniform := baseCount == n
+
+	diffCost := 3 * n
+	if len(hw) == len(frame) {
+		diffCost = countDiff(frame, hw)
+	}
+	baseCost := allPortCost + countDiffFrom(frame, base)
+
+	var all *device.Color
+	if startBreathe > 0 || len(hw) != len(frame) || baseCost < diffCost {
+		all = &base
+		budget -= allPortCost
+		for i := 1; i <= n; i++ {
+			next[i] = base
+		}
+	} else if reassert && uniform && diffCost == 0 && time.Since(lastAll) >= uniformReassert {
+		all = &base
+		budget -= allPortCost
+	}
+
+	type cand struct {
+		w     device.ChannelWrite
+		delta int
+	}
+	var cands []cand
+	for i := 1; i <= n; i++ {
+		for ch := 0; ch < 3; ch++ {
+			want, have := chanVal(frame[i], ch), chanVal(next[i], ch)
+			d := int(want) - int(have)
+			if d < 0 {
+				d = -d
+			}
+			level := int(want)
+			if int(have) > level {
+				level = int(have)
+			}
+			if d == 0 || (want != 0 && d*minDeltaFrac <= level) {
+				continue
+			}
+			cands = append(cands, cand{device.ChannelWrite{Port: i, Ch: channels[ch], Value: want}, d})
 		}
 	}
-	return true, first
+	sort.SliceStable(cands, func(a, b int) bool { return cands[a].delta > cands[b].delta })
+
+	writes := make([]device.ChannelWrite, 0, budget)
+	for _, c := range cands {
+		if len(writes) >= budget {
+			break
+		}
+		writes = append(writes, c.w)
+	}
+
+	// Trickle reassert with whatever budget is left (not needed when this
+	// frame already rewrote every port via the all-ports write).
+	if reassert && all == nil && !uniform {
+		for k := 0; k < reassertPortsPerFrame && len(writes)+3 <= budget; k++ {
+			port := cursor%n + 1
+			cursor++
+			for ch := 0; ch < 3; ch++ {
+				writes = append(writes, device.ChannelWrite{Port: port, Ch: channels[ch], Value: chanVal(frame[port], ch)})
+			}
+		}
+	}
+
+	if all == nil && len(writes) == 0 {
+		return nil
+	}
+	if err := client.SendFrame(all, writes, startBreathe); err != nil {
+		return err
+	}
+
+	for _, w := range writes {
+		c := &next[w.Port]
+		switch w.Ch {
+		case 'r':
+			c.R = w.Value
+		case 'g':
+			c.G = w.Value
+		default:
+			c.B = w.Value
+		}
+	}
+	s.mu.Lock()
+	if s.client == client {
+		s.hw = next
+		s.reassertAt = cursor
+		if all != nil {
+			s.lastAll = time.Now()
+		}
+		if startBreathe > 0 && s.behavior == startBreathe {
+			s.breatheOn = true
+		}
+	}
+	s.mu.Unlock()
+	return nil
 }
 
-// lastMatches reports whether the last-sent buffer equals the target frame.
-func lastMatches(last, frame []device.Color) bool {
-	if len(last) != len(frame) {
-		return false
-	}
+// dominantColor returns the most common color among ports 1..n and its count.
+func dominantColor(frame []device.Color) (device.Color, int) {
+	counts := make(map[device.Color]int, 8)
+	var best device.Color
+	bestN := 0
 	for i := 1; i < len(frame); i++ {
-		if last[i] != frame[i] {
-			return false
+		counts[frame[i]]++
+		if c := counts[frame[i]]; c > bestN {
+			best, bestN = frame[i], c
 		}
 	}
-	return true
+	return best, bestN
+}
+
+// countDiff counts channels that differ between two frames of equal length.
+func countDiff(a, b []device.Color) int {
+	n := 0
+	for i := 1; i < len(a); i++ {
+		for ch := 0; ch < 3; ch++ {
+			if chanVal(a[i], ch) != chanVal(b[i], ch) {
+				n++
+			}
+		}
+	}
+	return n
+}
+
+// countDiffFrom counts channels in frame that differ from a single color.
+func countDiffFrom(frame []device.Color, c device.Color) int {
+	n := 0
+	for i := 1; i < len(frame); i++ {
+		for ch := 0; ch < 3; ch++ {
+			if chanVal(frame[i], ch) != chanVal(c, ch) {
+				n++
+			}
+		}
+	}
+	return n
 }
 
 // Manager owns every Switch: creates one supervise-goroutine per configured
@@ -150,8 +302,9 @@ func NewManager(cfgs []config.Switch) *Manager {
 	m := &Manager{log: log}
 	for _, c := range cfgs {
 		s := &Switch{
-			Name: c.Name,
-			Host: c.Host,
+			Name:     c.Name,
+			Host:     c.Host,
+			behavior: -1,
 			cfg: device.Config{
 				Name:     c.Name,
 				Addr:     c.Host,
@@ -199,6 +352,15 @@ func (m *Manager) Stop() {
 	}
 }
 
+// resetLEDState forgets what we believe the LEDs show, forcing a full push
+// (and a behavior resend) on the next frame.
+func (s *Switch) resetLEDState() {
+	s.hw = nil
+	s.lastAll = time.Time{}
+	s.behavior = -1
+	s.breatheOn = false
+}
+
 // supervise is the per-switch main loop. It Dials, discovers info, uploads
 // and starts the agent script, then blocks on either context cancellation
 // or SSH connection death. On death it closes the client and loops back to
@@ -240,8 +402,7 @@ func (m *Manager) supervise(ctx context.Context, s *Switch) {
 		s.mu.Lock()
 		s.client = c
 		s.info = info
-		s.lastSent = nil
-		s.lastFullPush = time.Time{}
+		s.resetLEDState()
 		s.mu.Unlock()
 		s.log.Info("connected", "model", info.Model, "hostname", info.Hostname, "version", info.Version)
 
@@ -260,8 +421,7 @@ func (m *Manager) supervise(ctx context.Context, s *Switch) {
 			_ = c.Close()
 			s.mu.Lock()
 			s.client = nil
-			s.lastSent = nil
-			s.lastFullPush = time.Time{}
+			s.resetLEDState()
 			s.mu.Unlock()
 			// small pause so we don't slam the switch during transient issues
 			select {
@@ -273,4 +433,3 @@ func (m *Manager) supervise(ctx context.Context, s *Switch) {
 		}
 	}
 }
-
