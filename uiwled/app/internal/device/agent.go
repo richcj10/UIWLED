@@ -3,40 +3,43 @@ package device
 // agentScript is uploaded to each switch and run as a long-lived process.
 // It reads compact commands from stdin and writes /proc/led/* directly.
 //
-// Protocol (one command per line, space-separated):
-//   A RR GG BB br          — all ports to hex color RR GG BB, brightness 0-100
-//   P n RR GG BB           — port n to hex color RR GG BB (via led_code)
-//   L n r|g|b val          — port n single channel decimal val (via led_color fallback)
-//   Q                      — quit
+// Protocol (one command per line, space-separated; values are pre-scaled by
+// the daemon so the loop does no arithmetic):
+//
+//	C n ch val   port n, channel ch (r|g|b), value 0-65535 -> led_color
+//	A r g b      every port to 16-bit r g b -> led_all_port_color
+//	B n          controller behavior: 0 = solid, 2-11 = hardware breathe
+//	S            end of frame: reply "K" on stdout (frame ack / backpressure)
+//	Q            quit
 //
 // Kept as a single 'sh' script so we don't need to cross-compile a binary.
+// Measured on fw 7.5.15: the shell costs ~0.2 ms per line while the driver
+// costs ~1.9 ms per led_color write, so a native agent would gain little.
 const agentScript = `#!/bin/sh
-# UIWLED agent (v3)
+# UIWLED agent (v4)
 # Reads LED frame commands from stdin, drives /proc/led/*.
 #
-# Protocol (HA pre-scales all values so this loop does zero arithmetic):
-#   A rr gg bb br      hex RGB + decimal brightness, one write to led_all_port_code
-#   P n R100 G100 B100 decimal values (already scaled *100), 3 writes to led_color
-#   Q                  quit
+#   C n ch val   one channel of port n, 0-65535      (led_color)
+#   A r g b      all ports, 16-bit per channel       (led_all_port_color)
+#   B n          0 = solid, 2-11 = controller breathe (led_behavior)
+#   S            frame done -> echo K
+#   Q            quit
 #
-# NOTE: /proc/led/led_code (combined RGB per port) is broken on UniFi 7.4.1 —
-# it always renders reddish. We use per-channel led_color which works.
+# The /proc files are opened once and kept open (re-opening per write costs
+# ~20% more). /proc/led/led_code only accepts a fixed set of color codes, so
+# per-port color goes through led_color one channel at a time.
 
 echo 0 > /proc/led/led_mode 2>/dev/null
+echo 0 > /proc/led/led_behavior 2>/dev/null
+exec 3>/proc/led/led_color 4>/proc/led/led_all_port_color 2>/dev/null
 
-while IFS=' ' read -r op a b c d; do
+while IFS=' ' read -r op a b c; do
   case "$op" in
-    P)
-      echo "$a r $b" > /proc/led/led_color 2>/dev/null
-      echo "$a g $c" > /proc/led/led_color 2>/dev/null
-      echo "$a b $d" > /proc/led/led_color 2>/dev/null
-      ;;
-    A)
-      echo "$a $b $c $d" > /proc/led/led_all_port_code 2>/dev/null
-      ;;
+    C) echo "$a $b $c" >&3 ;;
+    A) echo "$a $b $c 0" >&4 ;;
+    B) echo "$a" > /proc/led/led_behavior ;;
+    S) echo K ;;
     Q) exit 0 ;;
-    "") ;;
-    *) ;;
   esac
 done
 `

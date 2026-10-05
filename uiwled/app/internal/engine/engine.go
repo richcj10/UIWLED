@@ -137,20 +137,25 @@ func (e *Engine) State(name string) *SegmentState {
 	defer e.mu.Unlock()
 	s, ok := e.states[name]
 	if !ok {
-		s = &SegmentState{
-			On:         true,
-			Brightness: 128,
-			Speed:      128,
-			Intensity:  128,
-			Colors: [3]device.Color{
-				{R: 255, G: 160, B: 0},  // amber
-				{R: 0, G: 60, B: 255},   // blue (used by wipe/fade)
-				{R: 0, G: 255, B: 60},   // green (spare)
-			},
-		}
+		s = newDefaultState()
 		e.states[name] = s
 	}
 	return s
+}
+
+// newDefaultState is the state a switch starts with before any user input.
+func newDefaultState() *SegmentState {
+	return &SegmentState{
+		On:         true,
+		Brightness: 128,
+		Speed:      128,
+		Intensity:  128,
+		Colors: [3]device.Color{
+			{R: 255, G: 160, B: 0}, // amber
+			{R: 0, G: 60, B: 255},  // blue (used by wipe/fade)
+			{R: 0, G: 255, B: 60},  // green (spare)
+		},
+	}
 }
 
 // SetState atomically mutates the state for a switch via the supplied
@@ -160,7 +165,7 @@ func (e *Engine) SetState(name string, mutate func(*SegmentState)) {
 	e.mu.Lock()
 	s, ok := e.states[name]
 	if !ok {
-		s = &SegmentState{On: true, Brightness: 128}
+		s = newDefaultState()
 		e.states[name] = s
 	}
 	mutate(s)
@@ -183,7 +188,8 @@ func (e *Engine) run(ctx context.Context) {
 	if e.fps <= 0 {
 		e.fps = 15
 	}
-	tick := time.NewTicker(time.Second / time.Duration(e.fps))
+	interval := time.Second / time.Duration(e.fps)
+	tick := time.NewTicker(interval)
 	defer tick.Stop()
 
 	tStart := time.Now()
@@ -199,6 +205,7 @@ func (e *Engine) run(ctx context.Context) {
 					continue
 				}
 				var frame []device.Color
+				behavior := 0
 				e.mu.Lock()
 				until, identifying := e.identifyU[sw.Name]
 				if identifying && now.Before(until) {
@@ -207,6 +214,7 @@ func (e *Engine) run(ctx context.Context) {
 				} else {
 					if identifying {
 						delete(e.identifyU, sw.Name)
+						identifying = false
 					}
 					state := e.states[sw.Name]
 					e.mu.Unlock()
@@ -214,14 +222,19 @@ func (e *Engine) run(ctx context.Context) {
 						state = e.State(sw.Name)
 					}
 					frame = renderFrame(info, state, elapsed)
+					behavior = hwBehavior(state)
 				}
 				// Apply per-jack overrides on top of the effect frame. Identify
 				// mode intentionally ignores overrides so the flash pattern is
-				// unambiguous.
+				// unambiguous. Under a hardware-breathe effect, overridden
+				// jacks breathe too.
 				if !identifying {
 					e.applyOverrides(sw.Name, frame, now)
 				}
-				if err := sw.PushFrame(frame); err != nil {
+				if err := sw.SetBehavior(behavior); err != nil {
+					e.log.Warn("set behavior failed", "switch", sw.Name, "err", err)
+				}
+				if err := sw.PushFrame(frame, interval); err != nil {
 					e.log.Warn("push frame failed", "switch", sw.Name, "err", err)
 				}
 			}

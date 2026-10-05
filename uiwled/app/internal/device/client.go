@@ -17,6 +17,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -24,13 +25,6 @@ import (
 
 // Color is an 8-bit RGB triple. Used as the frame-buffer element type.
 type Color struct{ R, G, B uint8 }
-
-// PortColor pairs a 1-based port index with its target color; the frame
-// pusher builds a []PortColor of the changed jacks each frame.
-type PortColor struct {
-	Index int
-	Color Color
-}
 
 // Info is the subset of `mca-cli-op info` we care about, plus the derived
 // jack layout (see LayoutFor).
@@ -73,6 +67,35 @@ type Client struct {
 	shellStdout  io.Reader // drained by shellDrainer goroutine
 	shellReady   bool
 	shellStopper chan struct{}
+
+	// Frame acks: SendFrame bumps pending, the agent answers each frame's
+	// trailing "S" with "K", and shellDrainer counts those back down. While
+	// a frame is outstanding the pusher skips new frames instead of queueing
+	// them in the SSH pipe, so a slow switch drops frames rather than lagging.
+	pending atomic.Int32
+	sentAt  atomic.Int64 // unix nanos of the last SendFrame
+}
+
+const (
+	// ackTimeout bounds how long we wait for a frame ack before assuming it
+	// was lost (agent restarted, shell reopened) and sending again.
+	ackTimeout = time.Second
+	// maxInFlight frames may be sent before the oldest is acked. One frame of
+	// slack absorbs ack jitter (an ack landing just after the next tick would
+	// otherwise skip a frame) while still bounding the backlog.
+	maxInFlight = 2
+)
+
+// Busy reports whether maxInFlight frames sent via the agent are unacked.
+func (c *Client) Busy() bool {
+	if c.pending.Load() < maxInFlight {
+		return false
+	}
+	if time.Since(time.Unix(0, c.sentAt.Load())) > ackTimeout {
+		c.pending.Store(0)
+		return false
+	}
+	return true
 }
 
 // Dial opens a fresh SSH connection using cfg. Returns a Client with the
@@ -208,6 +231,7 @@ func (c *Client) StartFrameShell() error {
 	c.shellStopper = make(chan struct{})
 	c.shellReady = true
 	c.shellMu.Unlock()
+	c.pending.Store(0)
 
 	go c.shellDrainer()
 	slog.Info("uiwled agent started on switch", "addr", c.cfg.Addr)
@@ -244,10 +268,10 @@ func (c *Client) stopShell() {
 	c.shellStdout = nil
 }
 
-// shellDrainer keeps the SSH channel unblocked by continuously reading and
-// discarding the agent's stdout. Without this, if the remote agent ever
-// wrote anything unexpected the SSH flow-control window would fill and
-// our stdin writes would eventually block.
+// shellDrainer keeps the SSH channel unblocked by continuously reading the
+// agent's stdout, and counts the "K" frame acks it finds there (see Busy).
+// Without the drain, the SSH flow-control window would fill and our stdin
+// writes would eventually block.
 func (c *Client) shellDrainer() {
 	buf := make([]byte, 4096)
 	for {
@@ -257,10 +281,14 @@ func (c *Client) shellDrainer() {
 		default:
 		}
 		// Read blocks until data arrives or the pipe closes; no busy loop.
-		// We intentionally discard output — frame writes produce none.
 		// No logging in this hot path — a debug log per read floods stdout and
 		// backpressures the whole shell channel.
-		_, err := c.shellStdout.Read(buf)
+		n, err := c.shellStdout.Read(buf)
+		for _, b := range buf[:n] {
+			if b == 'K' && c.pending.Add(-1) < 0 {
+				c.pending.Store(0)
+			}
+		}
 		if err != nil {
 			return
 		}
@@ -300,7 +328,7 @@ func (c *Client) shellFF(cmd string) error {
 
 // exec runs a single command on a fresh SSH session and returns combined
 // output. Use this for one-shot commands (info, mode changes). For per-frame
-// writes, use shellFF (via SetAllPorts / SetPortColors) to hit the agent.
+// writes, use shellFF (via SendFrame / SetBehavior) to hit the agent.
 func (c *Client) exec(cmd string) (string, error) {
 	return c.execOpts(cmd, false)
 }
