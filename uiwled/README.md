@@ -53,11 +53,19 @@ target_fps: 15           # 5-20 recommended
 
 ## Home Assistant integration
 
-Copy `custom_components/uiwled/` from the `config/` example (or install from HACS once packaged), restart Home Assistant, then:
+### Install via HACS (recommended)
 
-1. Settings → Devices & Services → Add Integration → **UIWLED**
-2. Host: `localhost`, Port: `8080` → Submit
-3. Two entities per configured switch appear: one `light.` and the shared `uiwled.*` services
+1. HACS → Integrations → ⋮ → **Custom repositories**
+2. Repository: `https://github.com/richcj10/uiwled` — Category: **Integration** → Add
+3. Install **UIWLED** from the HACS list, restart Home Assistant.
+4. Settings → Devices & Services → **Add Integration** → **UIWLED**
+5. Host: `localhost`, Port: `8080` → Submit.
+
+You'll get one `light.` entity per configured switch (with RGB + brightness + effect select), plus the `uiwled.set_port`, `uiwled.clear_port`, and `uiwled.clear_all_ports` services.
+
+### Install the addon
+
+Settings → Add-ons → Add-on Store → ⋮ → **Repositories** → add `https://github.com/richcj10/uiwled`, then install **UIWLED** from the store.
 
 ## Performance notes
 
